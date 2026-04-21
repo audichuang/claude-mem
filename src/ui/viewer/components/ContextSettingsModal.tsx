@@ -389,6 +389,8 @@ export function ContextSettingsModal({
                       <option value="gemini-2.5-flash-lite">gemini-2.5-flash-lite (10 RPM free)</option>
                       <option value="gemini-2.5-flash">gemini-2.5-flash (5 RPM free)</option>
                       <option value="gemini-3-flash-preview">gemini-3-flash-preview (5 RPM free)</option>
+                      <option value="gemini-3.1-flash-lite-preview">gemini-3.1-flash-lite-preview (15 RPM free)</option>
+                      <option value="gemini-3.1-pro-preview">gemini-3.1-pro-preview</option>
                     </select>
                   </FormField>
                   <div className="toggle-group" style={{ marginTop: '8px' }}>
