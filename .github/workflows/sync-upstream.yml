@@ -86,17 +86,19 @@ jobs:
 
           for br in ${{ env.FIX_BRANCHES }}; do
             git checkout "$br"
-            git rebase "$TAG"
+            # --onto moves only our commits (upstream/main..br) onto $TAG.
+            # Without --onto, an "already ahead" branch stays put instead
+            # of being moved back to the tag — and then the cherry-pick
+            # step below pulls in upstream's intermediate commits twice.
+            git rebase --onto "$TAG" upstream/main "$br"
             rc=$?
             if [ "$rc" -ne 0 ]; then
               FILES=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
               CONFLICT_BR="$br"
               CONFLICT_FILES="$FILES"
               git rebase --abort
-              # Stage a branch with the unresolved cherry-pick for the routine
               git checkout -B "auto/needs-review-$TAG" "$TAG"
-              BASE=$(git merge-base "$br" upstream/main)
-              git cherry-pick --no-commit "$BASE..$br" || true
+              git cherry-pick --no-commit "upstream/main..$br" || true
               break
             fi
           done
@@ -126,10 +128,11 @@ jobs:
           TAG=${{ steps.upstream.outputs.tag }}
           git checkout -B release-local "$TAG"
 
+          # After --onto above, each fix branch is $TAG..ours with no
+          # intermediate upstream commits, so cherry-picking $TAG..$br
+          # picks exactly our single commit per branch.
           for br in ${{ env.FIX_BRANCHES }}; do
-            BASE=$(git merge-base "$br" "$TAG")
-            TIP=$(git rev-parse "$br")
-            git cherry-pick "${BASE}..${TIP}"
+            git cherry-pick "${TAG}..${br}"
           done
 
           npm install --legacy-peer-deps
