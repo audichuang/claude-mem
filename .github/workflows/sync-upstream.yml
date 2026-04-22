@@ -1,0 +1,262 @@
+name: Sync with upstream releases
+
+on:
+  schedule:
+    - cron: '7 */6 * * *'   # every 6h, off-peak minute
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  UPSTREAM_REPO: thedotmack/claude-mem
+  FIX_BRANCHES: "fix/gemini-preview-models-v1beta feat/add-zh-tw-mode"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with: { node-version: '20' }
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream + tags
+        run: |
+          git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git
+          git fetch upstream main --tags --force
+
+      - name: Find latest upstream release tag
+        id: upstream
+        run: |
+          LATEST=$(git -c versionsort.suffix=- tag \
+                   --sort=-version:refname --list 'v*.*.*' \
+                   | grep -v '^my-release/' | head -1)
+          if [ -z "$LATEST" ]; then
+            echo "::error::No upstream release tags found"
+            exit 1
+          fi
+          echo "tag=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream release tag: $LATEST"
+
+      - name: Skip if already synced
+        id: check
+        run: |
+          if git tag --list "my-release/${{ steps.upstream.outputs.tag }}-*" | grep -q .; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Already synced ${{ steps.upstream.outputs.tag }}"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ensure auto-resolve label exists
+        if: steps.check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create auto-resolve \
+            --color F9D0C4 \
+            --description "GHA-created issue awaiting routine conflict resolution" \
+            2>/dev/null || true
+
+      - name: Attempt clean rebase of fix branches
+        id: rebase
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          set +e
+          TAG=${{ steps.upstream.outputs.tag }}
+          CONFLICT_BR=""
+          CONFLICT_FILES=""
+
+          for br in ${{ env.FIX_BRANCHES }}; do
+            git checkout "$br"
+            git rebase "$TAG"
+            rc=$?
+            if [ "$rc" -ne 0 ]; then
+              FILES=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
+              CONFLICT_BR="$br"
+              CONFLICT_FILES="$FILES"
+              git rebase --abort
+              # Stage a branch with the unresolved cherry-pick for the routine
+              git checkout -B "auto/needs-review-$TAG" "$TAG"
+              BASE=$(git merge-base "$br" upstream/main)
+              git cherry-pick --no-commit "$BASE..$br" || true
+              break
+            fi
+          done
+          set -e
+
+          if [ -n "$CONFLICT_BR" ]; then
+            echo "conflict=true"               >> "$GITHUB_OUTPUT"
+            echo "conflict_branch=$CONFLICT_BR" >> "$GITHUB_OUTPUT"
+            echo "conflict_files=$CONFLICT_FILES" >> "$GITHUB_OUTPUT"
+          else
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ───── SUCCESS PATH ─────────────────────────────────────────────
+
+      - name: Push rebased fix branches
+        if: steps.check.outputs.skip != 'true' && steps.rebase.outputs.conflict == 'false'
+        run: |
+          for br in ${{ env.FIX_BRANCHES }}; do
+            git push --force-with-lease origin "$br"
+          done
+
+      - name: Assemble release-local + rebuild + verify
+        id: build
+        if: steps.check.outputs.skip != 'true' && steps.rebase.outputs.conflict == 'false'
+        run: |
+          TAG=${{ steps.upstream.outputs.tag }}
+          git checkout -B release-local "$TAG"
+
+          for br in ${{ env.FIX_BRANCHES }}; do
+            BASE=$(git merge-base "$br" "$TAG")
+            TIP=$(git rev-parse "$br")
+            git cherry-pick "${BASE}..${TIP}"
+          done
+
+          npm install --legacy-peer-deps
+          npm run build
+
+          # Invariants: our fixes must survive
+          grep -q "v1beta/models"                plugin/scripts/worker-service.cjs
+          grep -q "gemini-3.1-flash-lite-preview" plugin/scripts/worker-service.cjs
+          grep -q "gemini-3.1-pro-preview"        plugin/scripts/worker-service.cjs
+          test -f plugin/modes/code--zh-tw.json
+          python3 -c "import json; json.load(open('plugin/modes/code--zh-tw.json'))"
+
+          # Fold rebuilt bundle into release-local if it changed
+          git add plugin/scripts plugin/ui
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: rebuild bundles for upstream $TAG"
+          fi
+
+          SHA=$(git rev-parse --short HEAD)
+          echo "release_sha=$SHA"                          >> "$GITHUB_OUTPUT"
+          echo "release_url=https://github.com/${{ github.repository }}/commit/$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Push release-local + rollback tag
+        id: push
+        if: steps.check.outputs.skip != 'true' && steps.rebase.outputs.conflict == 'false'
+        run: |
+          TAG=${{ steps.upstream.outputs.tag }}
+          DATE=$(date +%Y%m%d)
+          RELEASE_TAG="my-release/${TAG}-${DATE}"
+
+          git push --force-with-lease origin release-local
+          git tag "$RELEASE_TAG" release-local
+          git push origin "$RELEASE_TAG"
+
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Telegram 🟢 success
+        if: steps.check.outputs.skip != 'true' && steps.rebase.outputs.conflict == 'false'
+        run: |
+          TAG=${{ steps.upstream.outputs.tag }}
+          URL=${{ steps.build.outputs.release_url }}
+          RTAG=${{ steps.push.outputs.release_tag }}
+          TEXT=$(printf '🟢 claude-mem 自動同步完成 %s\n\nClean rebase，無衝突\nBundle 已 rebuild，sanity 全通過\nRelease: %s\n回滾 tag: %s\n\n有空跑 cm-update 拉到本機' "$TAG" "$URL" "$RTAG")
+          curl -sS -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            --data-urlencode "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            --data-urlencode "text=$TEXT"
+
+      # ───── CONFLICT PATH ────────────────────────────────────────────
+
+      - name: Push needs-review branch
+        if: steps.check.outputs.skip != 'true' && steps.rebase.outputs.conflict == 'true'
+        run: |
+          TAG=${{ steps.upstream.outputs.tag }}
+          git push --force-with-lease origin "auto/needs-review-$TAG"
+
+      - name: Open auto-resolve issue
+        id: issue
+        if: steps.check.outputs.skip != 'true' && steps.rebase.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=${{ steps.upstream.outputs.tag }}
+          BRANCH=${{ steps.rebase.outputs.conflict_branch }}
+          FILES="${{ steps.rebase.outputs.conflict_files }}"
+          REVIEW_BR="auto/needs-review-$TAG"
+
+          cat > /tmp/body.md <<EOF
+          Auto-generated: rebase of \`$BRANCH\` onto upstream $TAG hit merge conflicts. Routine handoff requested.
+
+          ## UPSTREAM_TAG
+          \`$TAG\`
+
+          ## BRANCH
+          \`$REVIEW_BR\` — has unresolved \`<<<<<<<\` markers cherry-picked in a clean tree.
+
+          ## CONFLICT_FILES
+          \`\`\`
+          $FILES
+          \`\`\`
+
+          ## RUNBOOK
+          1. Fetch the fork, check out \`$REVIEW_BR\`.
+          2. For each file in CONFLICT_FILES, resolve \`<<<<<<<\` markers. Keep upstream's new behavior where possible, but preserve our two fix intents (see below).
+          3. Reconstruct the two fix branches on top of \`$TAG\`:
+             - \`fix/gemini-preview-models-v1beta\` → single commit containing Gemini endpoint + preview model additions
+             - \`feat/add-zh-tw-mode\` → single commit adding \`plugin/modes/code--zh-tw.json\`
+          4. \`npm install --legacy-peer-deps && npm run build\`
+          5. Verify every line in INVARIANTS returns exit 0.
+          6. Build \`release-local = $TAG + cherry-pick fix/gemini... + cherry-pick feat/add-zh-tw-mode + rebuilt bundles commit\`.
+          7. Create rollback tag \`my-release/$TAG-\$(date +%Y%m%d)\` pointing at release-local.
+          8. Force-push all three branches + tag to origin.
+          9. Close this issue with a summary comment; send 🔵 Telegram.
+
+          ## INVARIANTS
+          After resolution, every command below MUST exit 0:
+          \`\`\`bash
+          grep -q "v1beta/models"                plugin/scripts/worker-service.cjs
+          grep -q "gemini-3.1-flash-lite-preview" plugin/scripts/worker-service.cjs
+          grep -q "gemini-3.1-pro-preview"        plugin/scripts/worker-service.cjs
+          test -f plugin/modes/code--zh-tw.json
+          python3 -c "import json; json.load(open('plugin/modes/code--zh-tw.json'))"
+          \`\`\`
+
+          ## ON_FAILURE
+          If any step fails or an invariant does not hold:
+          - Comment on this issue with the failing step and last 20 lines of stderr.
+          - Do NOT close the issue.
+          - Send 🔴 Telegram failure notification.
+
+          ## Our fix intents
+          1. **Gemini v1beta fix** — \`GEMINI_API_URL\` → \`v1beta/models\`; \`gemini-3.1-pro-preview\` and \`gemini-3.1-flash-lite-preview\` added to the \`GeminiModel\` type, \`GEMINI_RPM_LIMITS\`, \`validModels\` list in \`getGeminiConfig()\`, \`SettingsRoutes\` whitelist, and the viewer dropdown.
+          2. **zh-tw mode** — adds \`plugin/modes/code--zh-tw.json\` (pure file add, usually no conflict).
+          EOF
+
+          URL=$(gh issue create \
+            --title "[auto] Upstream $TAG rebase conflict — routine handoff" \
+            --body-file /tmp/body.md \
+            --label "auto-resolve")
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Telegram 🟡 conflict
+        if: steps.check.outputs.skip != 'true' && steps.rebase.outputs.conflict == 'true'
+        run: |
+          TAG=${{ steps.upstream.outputs.tag }}
+          FILES="${{ steps.rebase.outputs.conflict_files }}"
+          URL=${{ steps.issue.outputs.url }}
+          TEXT=$(printf '🟡 claude-mem 同步 %s 遇到衝突\n\n衝突檔：%s\n已開 issue: %s\n\nRoutine 下次 tick (≤3h) 會接手' "$TAG" "$FILES" "$URL")
+          curl -sS -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            --data-urlencode "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            --data-urlencode "text=$TEXT"
